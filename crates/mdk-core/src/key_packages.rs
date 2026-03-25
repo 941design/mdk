@@ -2,6 +2,7 @@
 
 use mdk_storage_traits::MdkStorageProvider;
 use mdk_storage_traits::mls_codec::MlsCodec;
+use nostr::nips::nip01::Coordinate;
 use nostr::secp256k1::rand::{RngCore, rngs::OsRng};
 use nostr::{Event, PublicKey, RelayUrl, Tag, TagKind};
 use openmls::ciphersuite::hash_ref::HashReference;
@@ -11,9 +12,7 @@ use openmls_basic_credential::SignatureKeyPair;
 use tls_codec::{Deserialize as TlsDeserialize, Serialize as TlsSerialize};
 
 use crate::MDK;
-use crate::constant::{
-    DEFAULT_CIPHERSUITE, MLS_KEY_PACKAGE_KIND, MLS_KEY_PACKAGE_KIND_LEGACY, TAG_EXTENSIONS,
-};
+use crate::constant::{DEFAULT_CIPHERSUITE, TAG_EXTENSIONS};
 use crate::error::Error;
 use crate::util::{ContentEncoding, NostrTagFormat, decode_content, encode_content};
 
@@ -138,6 +137,9 @@ fn validate_d_tag_value(d: &str, field_name: &str) -> Result<(), Error> {
 pub fn validate_existing_d_tag(d: &str) -> Result<(), Error> {
     validate_d_tag_value(d, "existing_d_tag")
 }
+
+// Re-export kind constants for filter construction and event building
+pub use crate::constant::{MLS_KEY_PACKAGE_KIND, MLS_KEY_PACKAGE_KIND_LEGACY};
 
 impl<Storage> MDK<Storage>
 where
@@ -505,6 +507,75 @@ where
         self.validate_key_package_tags(event, Some(&key_package))?;
 
         Ok(key_package)
+    }
+
+    /// Selects the best KeyPackage event from a set of candidates.
+    ///
+    /// Selection criteria (in order):
+    /// 1. Reject events that are not kind 30443 or legacy kind 443
+    /// 2. Reject events that fail KeyPackage decoding
+    /// 3. Prefer non-last_resort over last_resort candidates
+    /// 4. Among equal-priority candidates, prefer the newest `created_at`
+    /// 5. Tie-break by lexicographically smallest event id
+    ///
+    /// # Arguments
+    ///
+    /// * `candidates` - Slice of Nostr events to evaluate
+    ///
+    /// # Returns
+    ///
+    /// A reference to the best candidate event, or `None` if no valid candidates exist.
+    pub fn select_best_key_package<'a>(&self, candidates: &'a [Event]) -> Option<&'a Event> {
+        struct ValidCandidate<'a> {
+            event: &'a Event,
+            is_last_resort: bool,
+        }
+
+        let mut valid: Vec<ValidCandidate> = Vec::new();
+
+        for event in candidates {
+            if event.kind != MLS_KEY_PACKAGE_KIND && event.kind != MLS_KEY_PACKAGE_KIND_LEGACY {
+                continue;
+            }
+
+            let encoding = match ContentEncoding::from_tags(event.tags.iter()) {
+                Some(e) => e,
+                None => continue,
+            };
+
+            let kp = match self.parse_serialized_key_package(&event.content, encoding) {
+                Ok(kp) => kp,
+                Err(_) => continue,
+            };
+
+            valid.push(ValidCandidate {
+                event,
+                is_last_resort: kp.last_resort(),
+            });
+        }
+
+        if valid.is_empty() {
+            return None;
+        }
+
+        // Prefer non-last_resort candidates when available
+        let has_non_last_resort = valid.iter().any(|c| !c.is_last_resort);
+
+        let pool: Vec<&ValidCandidate> = if has_non_last_resort {
+            valid.iter().filter(|c| !c.is_last_resort).collect()
+        } else {
+            valid.iter().collect()
+        };
+
+        // Newest created_at, then smallest event id as tiebreaker
+        pool.into_iter()
+            .max_by(|a, b| {
+                a.event
+                    .created_at
+                    .cmp(&b.event.created_at)
+                    .then_with(|| b.event.id.to_hex().cmp(&a.event.id.to_hex()))
+            })
+            .map(|c| c.event)
     }
 
     /// Validates that key package event tags match MIP-00 specification.
@@ -932,6 +1003,86 @@ where
         PublicKey::from_slice(identity_bytes)
             .map_err(|e| Error::KeyPackage(format!("Invalid public key: {}", e)))
     }
+}
+
+/// Extracts the `d` tag value from an event, returning `None` if missing or empty.
+fn get_d_tag_value(event: &Event) -> Option<&str> {
+    event
+        .tags
+        .iter()
+        .find(|t| t.as_slice().first().map(|s| s.as_str()) == Some("d"))
+        .and_then(|t| t.as_slice().get(1).map(|s| s.as_str()))
+        .filter(|v| !v.is_empty())
+}
+
+/// Creates NIP-09 deletion tags for one or more KeyPackage events.
+///
+/// For kind 30443 (addressable) events, includes both `e` tags (event id) and `a` tags
+/// (addressable coordinate `30443:{pubkey}:{d}`) so relays can match either way.
+/// For kind 443 (legacy) events, only `e` tags are included.
+/// A `k` tag is included for each distinct kind observed.
+///
+/// The returned tags are suitable for a kind-5 (NIP-09) deletion event with empty content.
+///
+/// # Arguments
+///
+/// * `events` - Slice of key package events to delete
+///
+/// # Returns
+///
+/// A vector of tags for a kind-5 deletion event.
+///
+/// # Errors
+///
+/// Returns an error if any event is not a key package event (kind 443 or 30443),
+/// or if the events slice is empty.
+pub fn create_delete_key_package_tags(events: &[Event]) -> Result<Vec<Tag>, Error> {
+    use crate::constant::{MLS_KEY_PACKAGE_KIND, MLS_KEY_PACKAGE_KIND_LEGACY};
+
+    if events.is_empty() {
+        return Err(Error::KeyPackage(
+            "At least one event must be provided for deletion".to_string(),
+        ));
+    }
+
+    let mut tags = Vec::new();
+    let mut observed_kinds = std::collections::BTreeSet::new();
+
+    for event in events {
+        if event.kind != MLS_KEY_PACKAGE_KIND && event.kind != MLS_KEY_PACKAGE_KIND_LEGACY {
+            return Err(Error::UnexpectedEvent {
+                expected: MLS_KEY_PACKAGE_KIND,
+                received: event.kind,
+            });
+        }
+
+        observed_kinds.insert(event.kind);
+        tags.push(Tag::event(event.id));
+
+        // For addressable kind:30443 events, include an `a` tag with the
+        // coordinate so relays can match by (kind, pubkey, d) tuple.
+        if event.kind == MLS_KEY_PACKAGE_KIND {
+            if let Some(d_value) = get_d_tag_value(event) {
+                let coordinate = Coordinate {
+                    kind: MLS_KEY_PACKAGE_KIND,
+                    public_key: event.pubkey,
+                    identifier: d_value.to_string(),
+                };
+                tags.push(Tag::coordinate(coordinate, None));
+            }
+        }
+    }
+
+    // Prepend k tags for each observed kind
+    let k_tags: Vec<Tag> = observed_kinds
+        .iter()
+        .map(|kind| Tag::custom(TagKind::Custom("k".into()), [kind.as_u16().to_string()]))
+        .collect();
+
+    let mut result = k_tags;
+    result.append(&mut tags);
+
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -3612,5 +3763,295 @@ mod tests {
             "Should accept bare legacy kind:443 KeyPackage event without d and i tags, got: {:?}",
             result
         );
+    }
+
+    // ======================================================================
+    // Caller-supplied d-tag tests
+    // ======================================================================
+
+    #[test]
+    fn test_create_key_package_with_explicit_d_tag() {
+        let mdk = create_test_mdk();
+        let test_pubkey =
+            PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
+                .unwrap();
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
+        // 64-hex literal representing the "my-desktop-client-slot" fixture
+        let my_d = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+
+        let KeyPackageEventData {
+            tags_30443: tags,
+            d_tag: d_value,
+            ..
+        } = mdk
+            .create_key_package_for_event_with_options(
+                &test_pubkey,
+                relays,
+                KeyPackageOptions {
+                    existing_d_tag: Some(my_d.to_string()),
+                    ..Default::default()
+                },
+            )
+            .expect("Failed to create key package with explicit d tag");
+
+        assert_eq!(d_value, my_d, "Returned d value should match the supplied one");
+        assert_eq!(
+            tags[0].content().unwrap(),
+            my_d,
+            "d tag in event should match"
+        );
+    }
+
+    #[test]
+    fn test_create_key_package_with_empty_d_tag_fails() {
+        let mdk = create_test_mdk();
+        let test_pubkey =
+            PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
+                .unwrap();
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
+
+        let result = mdk.create_key_package_for_event_with_options(
+            &test_pubkey,
+            relays,
+            KeyPackageOptions {
+                existing_d_tag: Some(String::new()),
+                ..Default::default()
+            },
+        );
+        assert!(result.is_err(), "Empty d tag should fail");
+        assert!(result.unwrap_err().to_string().contains("must not be empty"));
+    }
+
+    #[test]
+    fn test_create_key_package_with_none_d_tag_generates_random() {
+        let mdk = create_test_mdk();
+        let test_pubkey =
+            PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
+                .unwrap();
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
+
+        let d1 = mdk
+            .create_key_package_for_event_with_options(
+                &test_pubkey,
+                relays.clone(),
+                KeyPackageOptions::default(),
+            )
+            .unwrap()
+            .d_tag;
+        let d2 = mdk
+            .create_key_package_for_event_with_options(
+                &test_pubkey,
+                relays,
+                KeyPackageOptions::default(),
+            )
+            .unwrap()
+            .d_tag;
+
+        assert_eq!(d1.len(), 64, "Random d should be 64 hex chars");
+        assert_ne!(d1, d2, "Two random d values should differ");
+    }
+
+    // ======================================================================
+    // NIP-09 deletion tag tests
+    // ======================================================================
+
+    #[test]
+    fn test_create_delete_tags_for_addressable_event() {
+        let mdk = create_test_mdk();
+        let keys = Keys::generate();
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
+
+        let KeyPackageEventData {
+            content,
+            tags_30443: tags,
+            d_tag: d_value,
+            ..
+        } = mdk
+            .create_key_package_for_event(&keys.public_key(), relays)
+            .unwrap();
+
+        let event = EventBuilder::new(MLS_KEY_PACKAGE_KIND, content)
+            .tags(tags)
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let delete_tags =
+            super::create_delete_key_package_tags(&[event.clone()]).unwrap();
+
+        // Should have: k tag + e tag + a tag = 3 tags
+        assert_eq!(delete_tags.len(), 3, "Expected k + e + a tags");
+
+        // k tag
+        assert_eq!(delete_tags[0].as_slice()[0], "k");
+        assert_eq!(
+            delete_tags[0].as_slice()[1],
+            MLS_KEY_PACKAGE_KIND.as_u16().to_string()
+        );
+
+        // e tag
+        assert_eq!(delete_tags[1].as_slice()[0], "e");
+        assert_eq!(delete_tags[1].as_slice()[1], event.id.to_hex());
+
+        // a tag with coordinate
+        assert_eq!(delete_tags[2].as_slice()[0], "a");
+        let expected_coord = format!(
+            "{}:{}:{}",
+            MLS_KEY_PACKAGE_KIND.as_u16(),
+            event.pubkey.to_hex(),
+            d_value
+        );
+        assert_eq!(delete_tags[2].as_slice()[1], expected_coord);
+    }
+
+    #[test]
+    fn test_create_delete_tags_empty_events_fails() {
+        let result = super::create_delete_key_package_tags(&[]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("At least one event"));
+    }
+
+    #[test]
+    fn test_create_delete_tags_wrong_kind_fails() {
+        let keys = Keys::generate();
+        let event = EventBuilder::new(Kind::TextNote, "not a key package")
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let result = super::create_delete_key_package_tags(&[event]);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            crate::Error::UnexpectedEvent { .. }
+        ));
+    }
+
+    // ======================================================================
+    // select_best_key_package tests
+    // ======================================================================
+
+    #[test]
+    fn test_select_best_key_package_empty_candidates() {
+        let mdk = create_test_mdk();
+        assert!(mdk.select_best_key_package(&[]).is_none());
+    }
+
+    #[test]
+    fn test_select_best_key_package_single_valid() {
+        let mdk = create_test_mdk();
+        let keys = Keys::generate();
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
+
+        let KeyPackageEventData {
+            content,
+            tags_30443: tags,
+            ..
+        } = mdk
+            .create_key_package_for_event(&keys.public_key(), relays)
+            .unwrap();
+
+        let event = EventBuilder::new(MLS_KEY_PACKAGE_KIND, content)
+            .tags(tags)
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let candidates = [event.clone()];
+        let best = mdk.select_best_key_package(&candidates);
+        assert!(best.is_some());
+        assert_eq!(best.unwrap().id, event.id);
+    }
+
+    #[test]
+    fn test_select_best_key_package_rejects_wrong_kind() {
+        let mdk = create_test_mdk();
+        let keys = Keys::generate();
+        let event = EventBuilder::new(Kind::TextNote, "not a key package")
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        assert!(mdk.select_best_key_package(&[event]).is_none());
+    }
+
+    // ======================================================================
+    // d-tag parse validation regression tests (CodeRabbit review items)
+    // ======================================================================
+
+    #[test]
+    fn test_parse_legacy_kind_443_succeeds() {
+        let mdk = create_test_mdk();
+        let keys = Keys::generate();
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
+
+        let KeyPackageEventData {
+            content,
+            tags_30443: mut tags,
+            ..
+        } = mdk
+            .create_key_package_for_event(&keys.public_key(), relays)
+            .unwrap();
+
+        // Remove the d tag (first tag) since legacy kind:443 has no d tag
+        tags.remove(0);
+
+        let event = EventBuilder::new(Kind::Custom(443), content)
+            .tags(tags)
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let result = mdk.parse_key_package(&event);
+        assert!(result.is_ok(), "Legacy kind:443 without d tag should parse");
+    }
+
+    #[test]
+    fn test_parse_kind_30443_missing_d_tag_fails() {
+        let mdk = create_test_mdk();
+        let keys = Keys::generate();
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
+
+        let KeyPackageEventData {
+            content,
+            tags_30443: mut tags,
+            ..
+        } = mdk
+            .create_key_package_for_event(&keys.public_key(), relays)
+            .unwrap();
+
+        // Remove the d tag (first tag)
+        tags.remove(0);
+
+        let event = EventBuilder::new(MLS_KEY_PACKAGE_KIND, content)
+            .tags(tags)
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let result = mdk.parse_key_package(&event);
+        assert!(result.is_err(), "Kind:30443 without d tag should fail");
+        assert!(result.unwrap_err().to_string().contains("Missing required d tag"));
+    }
+
+    #[test]
+    fn test_parse_kind_30443_empty_d_tag_fails() {
+        let mdk = create_test_mdk();
+        let keys = Keys::generate();
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
+
+        let KeyPackageEventData {
+            content,
+            tags_30443: mut tags,
+            ..
+        } = mdk
+            .create_key_package_for_event(&keys.public_key(), relays)
+            .unwrap();
+
+        // Replace d tag with one that has an empty value
+        tags[0] = Tag::identifier("");
+
+        let event = EventBuilder::new(MLS_KEY_PACKAGE_KIND, content)
+            .tags(tags)
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let result = mdk.parse_key_package(&event);
+        assert!(result.is_err(), "Kind:30443 with empty d tag should fail");
+        assert!(result.unwrap_err().to_string().contains("must not be empty"));
     }
 }

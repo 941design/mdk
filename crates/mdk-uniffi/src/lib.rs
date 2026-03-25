@@ -766,6 +766,41 @@ impl Mdk {
         Ok(event.content)
     }
 
+    /// Select the best key package from a set of candidate events.
+    ///
+    /// Returns the JSON of the best event, or `None` if no valid candidates exist.
+    /// See `MDK::select_best_key_package` for selection criteria.
+    pub fn select_best_key_package(
+        &self,
+        candidate_event_jsons: Vec<String>,
+    ) -> Result<Option<String>, MdkUniffiError> {
+        let events: Vec<Event> = candidate_event_jsons
+            .iter()
+            .map(|json| parse_json(json, "candidate event JSON"))
+            .collect::<Result<_, _>>()?;
+
+        let mdk = self.lock()?;
+        let best = mdk.select_best_key_package(&events);
+        Ok(best.map(|e| serde_json::to_string(e).unwrap_or_default()))
+    }
+
+    /// Create NIP-09 deletion tags for one or more key package events.
+    ///
+    /// Returns tags suitable for a kind-5 deletion event (content should be empty).
+    /// For kind 30443 events, includes both `e` and `a` tags for relay matching.
+    pub fn create_delete_key_package_tags(
+        &self,
+        event_jsons: Vec<String>,
+    ) -> Result<Vec<Vec<String>>, MdkUniffiError> {
+        let events: Vec<Event> = event_jsons
+            .iter()
+            .map(|json| parse_json(json, "key package event JSON"))
+            .collect::<Result<_, _>>()?;
+
+        let tags = mdk_core::key_packages::create_delete_key_package_tags(&events)?;
+        Ok(tags.iter().map(|tag| tag.as_slice().to_vec()).collect())
+    }
+
     /// Get all groups
     pub fn get_groups(&self) -> Result<Vec<Group>, MdkUniffiError> {
         Ok(self
