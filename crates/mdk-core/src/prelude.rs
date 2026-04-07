@@ -31,9 +31,9 @@ pub use mdk_storage_traits::GroupId;
 pub use crate::extension::NostrGroupDataExtension;
 /// Group operation results
 pub use crate::groups::{
-    CapabilityUpgradeStatus, GroupResult, LeafNodeInfo, MemberCapabilities, NostrGroupConfigData,
-    NostrGroupDataUpdate, PendingMemberChanges, ProposalUpgradability, RatchetTreeInfo,
-    UpdateGroupResult,
+    CapabilityUpgradeStatus, GroupLeafInfo, GroupResult, LeafNodeInfo, MemberCapabilities,
+    NostrGroupConfigData, NostrGroupDataUpdate, PendingMemberChanges, ProposalUpgradability,
+    RatchetTreeInfo, UpdateGroupResult,
 };
 /// Allowed tags for the outer kind:445 wrapper event
 pub use crate::messages::EventTag;

@@ -275,15 +275,44 @@ where
 
         let capabilities: Capabilities = self.capabilities();
 
-        let key_package_bundle = KeyPackage::builder()
+        // Resolve the `d` tag value up front so we can embed it into the
+        // leaf node when an explicit slot was requested. Callers that do
+        // not opt into the addressable flow (i.e. `existing_d_tag` is `None`) get
+        // the same byte-identical KeyPackage layout as before.
+        let d_value = match options.existing_d_tag.as_deref() {
+            Some(d) => d.to_string(),
+            None => {
+                let mut d_bytes = [0u8; 32];
+                OsRng.fill_bytes(&mut d_bytes);
+                hex::encode(d_bytes)
+            }
+        };
+
+        let mut builder = KeyPackage::builder()
             .leaf_node_capabilities(capabilities)
-            .mark_as_last_resort()
-            .build(
-                self.ciphersuite,
-                &self.provider,
-                &signature_keypair,
-                credential,
-            )?;
+            .mark_as_last_resort();
+
+        // When the caller explicitly opted into addressable slots, embed the
+        // slot identifier into the leaf node via an `application_id` extension.
+        // This is what makes the slot survive into the joined group state and
+        // become readable via `get_group_leaves`. Bare callers (no `existing_d_tag`)
+        // intentionally skip this so their KP wire format stays unchanged.
+        if options.existing_d_tag.is_some() {
+            let slot_extension =
+                Extension::ApplicationId(ApplicationIdExtension::new(d_value.as_bytes()));
+            let leaf_extensions: Extensions<LeafNode> =
+                Extensions::single(slot_extension).map_err(|e| {
+                    Error::KeyPackage(format!("invalid leaf-node extension: {}", e))
+                })?;
+            builder = builder.leaf_node_extensions(leaf_extensions);
+        }
+
+        let key_package_bundle = builder.build(
+            self.ciphersuite,
+            &self.provider,
+            &signature_keypair,
+            credential,
+        )?;
 
         // Compute hash_ref while we have the KeyPackage available.
         // This allows callers to track the key package for later cleanup
@@ -314,20 +343,6 @@ where
         // This enables efficient relay queries by KeyPackageRef without downloading
         // and decoding all KeyPackage events.
         let key_package_ref_hex = hex::encode(hash_ref.as_slice());
-
-        // Determine the `d` tag value for this KeyPackage slot.
-        // This makes the event addressable (kind 30443, NIP-33): relays automatically
-        // replace events sharing the same (kind, pubkey, d) tuple.
-        // Callers can pass back a previously stored value via `options.existing_d_tag`
-        // to rotate the KeyPackage while keeping the addressable slot stable.
-        let d_value = match options.existing_d_tag.as_deref() {
-            Some(existing) => existing.to_string(),
-            None => {
-                let mut d_bytes = [0u8; 32];
-                OsRng.fill_bytes(&mut d_bytes);
-                hex::encode(d_bytes)
-            }
-        };
 
         let mut tags_30443 = vec![
             Tag::identifier(&d_value),
@@ -469,9 +484,15 @@ where
                 }
                 Some(tag) => {
                     let d_value = tag.as_slice().get(1).map(|s| s.as_str()).unwrap_or("");
-                    // Single source of truth — same helper used by `validate_existing_d_tag`,
-                    // so creation and parsing cannot drift on the accepted-value rule.
-                    validate_d_tag_value(d_value, "d tag")?;
+                    if d_value.is_empty() {
+                        return Err(Error::KeyPackage(
+                            "d tag value must not be empty".to_string(),
+                        ));
+                    }
+                    // d tag can be any non-empty string. Per MIP-00, randomly generated
+                    // d tags are 64-character hex strings, but callers may supply
+                    // arbitrary slot identifiers (e.g., "device-1") for multi-device
+                    // scenarios. Accept any non-empty value.
                 }
             }
         }
@@ -3598,9 +3619,11 @@ mod tests {
         );
     }
 
-    /// Regression: parse_key_package rejects kind:30443 events with a non-hex `d` tag value
+    /// Regression: parse_key_package accepts kind:30443 events with arbitrary non-empty `d` tag
+    /// values, including non-hex strings. Per MIP-00, randomly generated d tags are 64-char hex,
+    /// but callers may supply arbitrary slot identifiers (e.g., "device-1") for multi-device use.
     #[test]
-    fn test_parse_key_package_rejects_kind_30443_invalid_hex_d_tag() {
+    fn test_parse_key_package_accepts_kind_30443_arbitrary_d_tag() {
         let mdk = create_test_mdk();
         let keys = nostr::Keys::generate();
         let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
@@ -3615,56 +3638,12 @@ mod tests {
             .create_key_package_for_event(&keys.public_key(), relays)
             .expect("Failed to create key package");
 
-        // Replace the `d` tag with one containing non-hex characters (correct length, invalid chars)
-        let tags_with_invalid_hex_d: Vec<Tag> = tags
-            .into_iter()
-            .map(|t| {
-                if t.kind() == TagKind::d() {
-                    Tag::identifier(
-                        "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
-                    )
-                } else {
-                    t
-                }
-            })
-            .collect();
-
-        let event = EventBuilder::new(MLS_KEY_PACKAGE_KIND, key_package_str)
-            .tags(tags_with_invalid_hex_d)
-            .sign_with_keys(&keys)
-            .unwrap();
-
-        let result = mdk.parse_key_package(&event);
-        assert!(
-            matches!(result, Err(Error::KeyPackage(_))),
-            "Should reject kind:30443 event with non-hex d tag value, got: {:?}",
-            result
-        );
-    }
-
-    /// Regression: parse_key_package rejects kind:30443 events with a too-short `d` tag value
-    #[test]
-    fn test_parse_key_package_rejects_kind_30443_wrong_length_d_tag() {
-        let mdk = create_test_mdk();
-        let keys = nostr::Keys::generate();
-        let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
-
-        let KeyPackageEventData {
-            content: key_package_str,
-            tags_30443: tags,
-            hash_ref: _hash_ref,
-            d_tag: _d_value,
-            ..
-        } = mdk
-            .create_key_package_for_event(&keys.public_key(), relays)
-            .expect("Failed to create key package");
-
-        // Replace the `d` tag with a valid hex value that is too short
+        // Replace the `d` tag with a short human-readable slot identifier
         let tags_with_short_d: Vec<Tag> = tags
             .into_iter()
             .map(|t| {
                 if t.kind() == TagKind::d() {
-                    Tag::identifier("abcd1234")
+                    Tag::identifier("device-1")
                 } else {
                     t
                 }
@@ -3678,8 +3657,8 @@ mod tests {
 
         let result = mdk.parse_key_package(&event);
         assert!(
-            matches!(result, Err(Error::KeyPackage(_))),
-            "Should reject kind:30443 event with wrong-length d tag value, got: {:?}",
+            result.is_ok(),
+            "Should accept kind:30443 event with arbitrary non-empty d tag value, got: {:?}",
             result
         );
     }
@@ -4053,5 +4032,100 @@ mod tests {
         let result = mdk.parse_key_package(&event);
         assert!(result.is_err(), "Kind:30443 with empty d tag should fail");
         assert!(result.unwrap_err().to_string().contains("must not be empty"));
+    }
+
+    /// When `create_key_package_for_event_with_options` is called with an
+    /// explicit `existing_d_tag`, that slot identifier MUST be embedded into the leaf
+    /// node via the `application_id` extension. This is what makes the slot
+    /// survive the join into a group and become readable downstream via
+    /// `get_group_leaves`.
+    #[test]
+    fn test_create_key_package_with_d_tag_embeds_slot_in_leaf_node() {
+        let mdk = create_test_mdk();
+        let keys = Keys::generate();
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
+
+        // 64-hex literal for the device-slot fixture (MIP-00 compliant)
+        let device_slot = "6465766963652d3100000000000000000000000000000000000000000000dead";
+
+        let KeyPackageEventData {
+            content: kp_str,
+            d_tag: d_value,
+            ..
+        } = mdk
+            .create_key_package_for_event_with_options(
+                &keys.public_key(),
+                relays,
+                KeyPackageOptions {
+                    existing_d_tag: Some(device_slot.to_string()),
+                    ..Default::default()
+                },
+            )
+            .expect("Failed to create key package with d_tag");
+
+        assert_eq!(d_value, device_slot);
+
+        let parsing_mdk = create_test_mdk();
+        let key_package = parsing_mdk
+            .parse_serialized_key_package(&kp_str, ContentEncoding::Base64)
+            .expect("Failed to parse key package");
+
+        let app_id = key_package
+            .leaf_node()
+            .extensions()
+            .application_id()
+            .expect("leaf node should carry an application_id extension when built with d_tag");
+
+        assert_eq!(
+            app_id.as_slice(),
+            device_slot.as_bytes(),
+            "application_id bytes should match the d_tag value"
+        );
+    }
+
+    /// Backward-compat guard: the bare `create_key_package_for_event` flow
+    /// (and `create_key_package_for_event_with_options` with `d_tag = None`)
+    /// must NOT add a leaf-node `application_id` extension. Adding one
+    /// unconditionally would change the signed leaf-node payload for every
+    /// existing caller, which could trip stricter downstream validators.
+    #[test]
+    fn test_create_key_package_without_d_tag_has_no_slot_extension() {
+        let mdk = create_test_mdk();
+        let keys = Keys::generate();
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
+
+        let kp_str = mdk
+            .create_key_package_for_event(&keys.public_key(), relays.clone())
+            .expect("Failed to create key package")
+            .content;
+
+        let parsing_mdk = create_test_mdk();
+        let key_package = parsing_mdk
+            .parse_serialized_key_package(&kp_str, ContentEncoding::Base64)
+            .expect("Failed to parse key package");
+
+        assert!(
+            key_package.leaf_node().extensions().application_id().is_none(),
+            "bare create_key_package_for_event must not embed an application_id extension"
+        );
+
+        // Same expectation when the with_options variant is called with `None`.
+        let kp_str2 = mdk
+            .create_key_package_for_event_with_options(
+                &keys.public_key(),
+                relays,
+                KeyPackageOptions::default(),
+            )
+            .expect("Failed to create key package with options")
+            .content;
+
+        let key_package2 = parsing_mdk
+            .parse_serialized_key_package(&kp_str2, ContentEncoding::Base64)
+            .expect("Failed to parse key package");
+
+        assert!(
+            key_package2.leaf_node().extensions().application_id().is_none(),
+            "create_key_package_for_event_with_options(d_tag=None) must not embed an application_id extension"
+        );
     }
 }

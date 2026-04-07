@@ -208,6 +208,39 @@ pub struct RatchetTreeInfo {
     pub leaf_nodes: Vec<LeafNodeInfo>,
 }
 
+/// Public information about a single leaf in an MLS group, including the
+/// per-device "slot" identifier (the `d` tag value passed to
+/// [`MDK::create_key_package_for_event_with_options`]) when one is present.
+///
+/// Use this to enumerate every leaf — including multiple leaves that share
+/// the same Nostr public key (e.g. one device per leaf). Each leaf has a
+/// distinct `leaf_index` even when their `pubkey` collides.
+///
+/// # Security Note
+///
+/// All fields are public information from the ratchet tree. No secret
+/// material is included.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupLeafInfo {
+    /// Stable leaf index in the ratchet tree (may have holes after removals).
+    pub leaf_index: u32,
+    /// Nostr public key parsed from the leaf's BasicCredential.
+    pub pubkey: PublicKey,
+    /// Hex-encoded HPKE encryption key.
+    pub encryption_key: String,
+    /// Hex-encoded MLS signature key.
+    pub signature_key: String,
+    /// Slot identifier embedded in the leaf node's `application_id` extension
+    /// when the leaf was produced via
+    /// [`MDK::create_key_package_for_event_with_options`] with an explicit
+    /// `d_tag`. `None` when the leaf has no `application_id` extension or
+    /// when the bytes are not valid UTF-8 (a `tracing::warn` is emitted in
+    /// the latter case).
+    pub slot: Option<String>,
+    /// `true` if this leaf belongs to the local MDK instance.
+    pub is_own_leaf: bool,
+}
+
 impl NostrGroupConfigData {
     /// Creates NostrGroupConfigData
     #[allow(clippy::too_many_arguments)]
@@ -930,6 +963,89 @@ where
         })
     }
 
+    /// Returns one [`GroupLeafInfo`] per occupied leaf in the ratchet tree.
+    ///
+    /// Unlike [`Self::get_members`], which collects pubkeys into a `BTreeSet`
+    /// (and therefore deduplicates when one Nostr pubkey owns multiple
+    /// devices), this method preserves one entry per leaf. Each entry
+    /// includes the slot identifier embedded by
+    /// [`MDK::create_key_package_for_event_with_options`] when the leaf was
+    /// produced through the addressable-key-package flow.
+    ///
+    /// Callers can use the returned `leaf_index` together with
+    /// [`Self::remove_leaves`] to remove a single device without affecting
+    /// the user's other leaves.
+    ///
+    /// # Arguments
+    ///
+    /// * `group_id` - The MLS group ID
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Vec<GroupLeafInfo>)` - Sorted by `leaf_index` ascending.
+    /// * `Err(Error::GroupNotFound)` - If the group does not exist.
+    /// * `Err(Error::Group)` - If the ratchet tree is internally inconsistent.
+    /// * `Err(Error::Provider)` - If the underlying storage cannot load the
+    ///   public-group view.
+    pub fn get_group_leaves(&self, group_id: &GroupId) -> Result<Vec<GroupLeafInfo>, Error> {
+        let mls_group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
+
+        // Load a public-group view of the same tree so we can fetch the full
+        // `LeafNode` (with its leaf-node extensions) for each member by index.
+        // `Member` (the type returned by `mls_group.members()`) only carries
+        // credential + signature_key + encryption_key, not the leaf node
+        // itself, and `MlsGroup::public_group()` is `pub(crate)` in
+        // openmls 0.8.1, so we cannot reach the tree directly.
+        let public_group = PublicGroup::load(self.provider.storage(), group_id.inner())
+            .map_err(|e| Error::Provider(e.to_string()))?
+            .ok_or(Error::GroupNotFound)?;
+
+        let own_leaf_index = mls_group.own_leaf_index();
+
+        let mut leaves: Vec<GroupLeafInfo> = Vec::new();
+        for member in mls_group.members() {
+            let leaf_index = member.index;
+            let leaf_node = public_group.leaf(leaf_index).ok_or_else(|| {
+                Error::Group(format!(
+                    "ratchet tree inconsistency: members() yielded leaf {} but PublicGroup::leaf returned None",
+                    leaf_index.u32()
+                ))
+            })?;
+
+            let pubkey = self.pubkey_for_leaf_node(leaf_node)?;
+
+            let slot = leaf_node.extensions().application_id().and_then(|app_id| {
+                match String::from_utf8(app_id.as_slice().to_vec()) {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "mdk_core::groups",
+                            leaf_index = leaf_index.u32(),
+                            error = %e,
+                            "Leaf node has non-UTF-8 application_id; reporting slot as None"
+                        );
+                        None
+                    }
+                }
+            });
+
+            leaves.push(GroupLeafInfo {
+                leaf_index: leaf_index.u32(),
+                pubkey,
+                encryption_key: hex::encode(&member.encryption_key),
+                signature_key: hex::encode(&member.signature_key),
+                slot,
+                is_own_leaf: leaf_index == own_leaf_index,
+            });
+        }
+
+        // `members()` already returns leaves in index order, but be defensive
+        // in case openmls iterator semantics change in the future.
+        leaves.sort_by_key(|l| l.leaf_index);
+
+        Ok(leaves)
+    }
+
     /// Gets the public keys of members that will be added from pending proposals in an MLS group
     ///
     /// This method examines pending Add proposals in the group and extracts the public keys
@@ -1309,6 +1425,189 @@ where
         Ok(UpdateGroupResult {
             evolution_event: commit_event,
             welcome_rumors: None, // serialized_group_info,
+            mls_group_id: group_id.clone(),
+        })
+    }
+
+    /// Remove specific leaves from a group by their leaf index.
+    ///
+    /// This is the leaf-precision counterpart to [`Self::remove_members`]:
+    /// when a single Nostr public key owns multiple leaves (one per device),
+    /// `remove_members` removes **every** leaf bound to that pubkey, while
+    /// this method removes only the leaves whose indices appear in
+    /// `leaf_indices`.
+    ///
+    /// Like `remove_members`, this updates the admin list atomically inside
+    /// the same MLS commit when the removal would leave an admin pubkey with
+    /// zero remaining leaves. The admin entry is stripped only when no
+    /// surviving leaf in the resulting tree maps back to that admin's
+    /// pubkey, so removing one of an admin's two devices does NOT demote
+    /// the admin.
+    ///
+    /// NOTE: This function does not merge the pending commit. Clients must
+    /// call `merge_pending_commit` only after a successful relay publish.
+    ///
+    /// # Arguments
+    ///
+    /// * `group_id` - The MLS group ID.
+    /// * `leaf_indices` - The leaf indices (as reported by
+    ///   [`GroupLeafInfo::leaf_index`]) to remove.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(UpdateGroupResult)`
+    ///
+    /// # Errors
+    ///
+    /// * `Error::GroupNotFound` - If the group does not exist.
+    /// * `Error::OwnLeafNotFound` - If the caller's leaf is missing.
+    /// * `Error::Group` - If the caller is not an admin, `leaf_indices` is
+    ///   empty, the caller's own leaf appears in `leaf_indices`, an index
+    ///   does not match an occupied leaf, or the resulting tree would have
+    ///   no admins.
+    pub fn remove_leaves(
+        &self,
+        group_id: &GroupId,
+        leaf_indices: &[u32],
+    ) -> Result<UpdateGroupResult, Error> {
+        if leaf_indices.is_empty() {
+            return Err(Error::Group(
+                "remove_leaves: leaf_indices must not be empty".to_string(),
+            ));
+        }
+
+        let mut mls_group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
+        let signer: SignatureKeyPair = self.load_mls_signer(&mls_group)?;
+
+        // Admin gate
+        let own_leaf = mls_group.own_leaf().ok_or(Error::OwnLeafNotFound)?;
+        if !self.is_leaf_node_admin(group_id, own_leaf)? {
+            return Err(Error::Group(
+                "Only group admins can remove leaves".to_string(),
+            ));
+        }
+
+        // Self-removal guard — MLS does not allow a member to commit their
+        // own removal.
+        let own_leaf_index = mls_group.own_leaf_index();
+        if leaf_indices.iter().any(|i| *i == own_leaf_index.u32()) {
+            return Err(Error::Group(
+                "Cannot remove your own leaf from the group".to_string(),
+            ));
+        }
+
+        // Validate every requested index points at an occupied leaf and
+        // collect the corresponding `LeafNodeIndex` values for the commit
+        // builder.
+        let mut openmls_indices: Vec<LeafNodeIndex> = Vec::with_capacity(leaf_indices.len());
+        for raw in leaf_indices {
+            let idx = LeafNodeIndex::new(*raw);
+            if mls_group.member_at(idx).is_none() {
+                return Err(Error::Group(format!(
+                    "remove_leaves: leaf index {} does not exist (tree hole or out of range)",
+                    raw
+                )));
+            }
+            openmls_indices.push(idx);
+        }
+
+        // Compute the set of pubkeys that will still own at least one leaf
+        // after the removal. An admin is stripped only when none of their
+        // leaves survive — this is the key behavioural difference vs
+        // `remove_members`, which strips on first match. The two methods
+        // intentionally have different semantics:
+        //   - `remove_members(pubkey)` = "this user is gone — remove all
+        //     their leaves and demote them from admin".
+        //   - `remove_leaves([leaf_index])` = "this device is gone —
+        //     remove only this leaf, leave admin intact if other devices
+        //     remain".
+        let removed_index_set: BTreeSet<u32> = leaf_indices.iter().copied().collect();
+        let mut surviving_pubkeys: BTreeSet<PublicKey> = BTreeSet::new();
+        for member in mls_group.members() {
+            if removed_index_set.contains(&member.index.u32()) {
+                continue;
+            }
+            let pk = self.pubkey_for_member(&member)?;
+            surviving_pubkeys.insert(pk);
+        }
+
+        let group_data = NostrGroupDataExtension::from_group(&mls_group)?;
+        let admins_to_strip: Vec<PublicKey> = group_data
+            .admins
+            .iter()
+            .copied()
+            .filter(|admin_pk| !surviving_pubkeys.contains(admin_pk))
+            .collect();
+
+        let updated_extensions = if !admins_to_strip.is_empty() {
+            let mut updated_data = group_data.clone();
+            for pk in &admins_to_strip {
+                updated_data.remove_admin(pk);
+            }
+            if updated_data.admins.is_empty() {
+                return Err(Error::Group(
+                    "Cannot remove all admins from the group".to_string(),
+                ));
+            }
+            let extension = Self::get_unknown_extension_from_group_data(&updated_data)?;
+            let mut extensions = mls_group.extensions().clone();
+            extensions.add_or_replace(extension)?;
+            Some(extensions)
+        } else {
+            None
+        };
+
+        // Build a single commit containing the requested removal proposals
+        // and, if needed, a GroupContextExtensions proposal to update the
+        // admin list.
+        let mut builder = mls_group
+            .commit_builder()
+            .propose_removals(openmls_indices.iter().cloned());
+
+        if let Some(ext) = updated_extensions {
+            builder = builder
+                .propose_group_context_extensions(ext)
+                .map_err(|e| Error::Group(e.to_string()))?;
+        }
+
+        let bundle = builder
+            .load_psks(self.provider.storage())
+            .map_err(|e| Error::Group(e.to_string()))?
+            .build(
+                self.provider.rand(),
+                self.provider.crypto(),
+                &signer,
+                |_| true,
+            )
+            .map_err(|e| Error::Group(e.to_string()))?
+            .stage_commit(&self.provider)
+            .map_err(|e| Error::Group(e.to_string()))?;
+
+        let welcome_option = bundle.to_welcome_msg();
+        let (commit_message, _, _group_info) = bundle.into_contents();
+
+        let serialized_commit_message = commit_message
+            .tls_serialize_detached()
+            .map_err(|e| Error::Group(e.to_string()))?;
+
+        let commit_event =
+            self.build_message_event(&mls_group.group_id().into(), serialized_commit_message, None)?;
+
+        self.track_processed_message(
+            commit_event.id,
+            &mls_group,
+            message_types::ProcessedMessageState::ProcessedCommit,
+        )?;
+
+        if welcome_option.is_some() {
+            return Err(Error::Group(
+                "Found welcomes when removing leaves".to_string(),
+            ));
+        }
+
+        Ok(UpdateGroupResult {
+            evolution_event: commit_event,
+            welcome_rumors: None,
             mls_group_id: group_id.clone(),
         })
     }
@@ -2559,7 +2858,7 @@ mod tests {
     use mdk_memory_storage::MdkMemoryStorage;
     use mdk_storage_traits::groups::GroupStorage;
     use mdk_storage_traits::messages::{MessageStorage, types as message_types};
-    use nostr::{Keys, PublicKey, TagKind, TagStandard, Timestamp};
+    use nostr::{EventId, Keys, PublicKey, TagKind, TagStandard, Timestamp};
     use openmls::prelude::{BasicCredential, ProposalType};
     use openmls_basic_credential::SignatureKeyPair;
 
@@ -6832,45 +7131,364 @@ mod tests {
         assert_eq!(info1, info2, "ratchet tree info should be deterministic");
     }
 
+    // ============================================================================
+    // get_group_leaves / remove_leaves multi-device tests
+    // ============================================================================
+
+    /// AC #1 (end-to-end): a leaf produced by `create_key_package_for_event_with_options`
+    /// with `d_tag = Some("device-1")` reports `slot == Some("device-1")`
+    /// when read via `get_group_leaves` after the join.
     #[test]
-    fn test_own_leaf_index_and_group_leaf_map() {
-        let alice_mdk = create_test_mdk();
-        let bob_mdk = create_test_mdk();
+    fn test_get_group_leaves_round_trip_slot() {
         let alice_keys = Keys::generate();
         let bob_keys = Keys::generate();
-        let bob_key_package = create_key_package_event(&bob_mdk, &bob_keys);
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+
+        let admins = vec![alice_keys.public_key()];
+        let bob_kp = create_key_package_event_with_d_tag(&bob_mdk, &bob_keys, "6465766963652d310000000000000000000000000000000000000000deadbeef");
 
         let create_result = alice_mdk
             .create_group(
                 &alice_keys.public_key(),
-                vec![bob_key_package],
-                create_nostr_group_config_data(vec![alice_keys.public_key()]),
+                vec![bob_kp],
+                create_nostr_group_config_data(admins),
             )
             .expect("Alice should create group");
-
         let group_id = create_result.group.mls_group_id.clone();
-        let bob_welcome_rumor = &create_result.welcome_rumors[0];
-        let bob_welcome = bob_mdk
-            .process_welcome(&nostr::EventId::all_zeros(), bob_welcome_rumor)
-            .expect("Bob should process welcome");
 
         alice_mdk
             .merge_pending_commit(&group_id)
-            .expect("Alice should merge commit");
+            .expect("Alice should merge create commit");
+
+        let bob_welcome = bob_mdk
+            .process_welcome(&EventId::all_zeros(), &create_result.welcome_rumors[0])
+            .expect("Bob should process welcome");
         bob_mdk
             .accept_welcome(&bob_welcome)
             .expect("Bob should accept welcome");
 
-        assert_eq!(alice_mdk.own_leaf_index(&group_id).unwrap(), 0);
-        assert_eq!(bob_mdk.own_leaf_index(&group_id).unwrap(), 1);
+        // Alice's view
+        let alice_leaves = alice_mdk
+            .get_group_leaves(&group_id)
+            .expect("Alice should get leaves");
+        assert_eq!(alice_leaves.len(), 2, "group should have 2 leaves");
 
-        let leaf_map = alice_mdk.group_leaf_map(&group_id).unwrap();
-        assert_eq!(leaf_map.get(&0), Some(&alice_keys.public_key()));
-        assert_eq!(leaf_map.get(&1), Some(&bob_keys.public_key()));
+        let bob_leaf = alice_leaves
+            .iter()
+            .find(|l| l.pubkey == bob_keys.public_key())
+            .expect("Bob's leaf should be present");
+        assert_eq!(
+            bob_leaf.slot,
+            Some("6465766963652d310000000000000000000000000000000000000000deadbeef".to_string()),
+            "Bob's slot should round-trip from his addressable KP"
+        );
+        assert!(!bob_leaf.is_own_leaf, "Bob's leaf is not Alice's own leaf");
+
+        let alice_leaf = alice_leaves
+            .iter()
+            .find(|l| l.pubkey == alice_keys.public_key())
+            .expect("Alice's leaf should be present");
+        assert!(alice_leaf.is_own_leaf, "Alice's leaf must be is_own_leaf");
+        assert_eq!(
+            alice_leaf.slot, None,
+            "Alice didn't use the addressable flow, so no slot"
+        );
+
+        // Bob's view: same data
+        let bob_leaves = bob_mdk
+            .get_group_leaves(&group_id)
+            .expect("Bob should get leaves");
+        assert_eq!(bob_leaves.len(), 2);
+        let bob_self = bob_leaves
+            .iter()
+            .find(|l| l.is_own_leaf)
+            .expect("Bob should see his own leaf");
+        assert_eq!(bob_self.pubkey, bob_keys.public_key());
+        assert_eq!(bob_self.slot, Some("6465766963652d310000000000000000000000000000000000000000deadbeef".to_string()));
     }
 
+    /// AC #2: the slot embedded in the leaf node survives a `self_update`.
+    /// This locks in the existing behaviour of `LeafNodeParameters::with_extensions`
+    /// which clones the current leaf's extensions into the new leaf node.
     #[test]
-    fn test_group_leaf_map_preserves_tree_holes() {
+    fn test_get_group_leaves_slot_survives_self_update() {
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+
+        let admins = vec![alice_keys.public_key()];
+        let bob_kp = create_key_package_event_with_d_tag(&bob_mdk, &bob_keys, "6465766963652d310000000000000000000000000000000000000000deadbeef");
+
+        let create_result = alice_mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![bob_kp],
+                create_nostr_group_config_data(admins),
+            )
+            .expect("Alice should create group");
+        let group_id = create_result.group.mls_group_id.clone();
+        alice_mdk.merge_pending_commit(&group_id).unwrap();
+
+        let bob_welcome = bob_mdk
+            .process_welcome(&EventId::all_zeros(), &create_result.welcome_rumors[0])
+            .unwrap();
+        bob_mdk.accept_welcome(&bob_welcome).unwrap();
+
+        // Bob self-updates and merges his own commit
+        let update = bob_mdk
+            .self_update(&group_id)
+            .expect("Bob should self-update");
+        bob_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Bob should merge his self-update");
+
+        // Bob's own view: slot still present
+        let bob_leaves = bob_mdk.get_group_leaves(&group_id).unwrap();
+        let bob_self = bob_leaves.iter().find(|l| l.is_own_leaf).unwrap();
+        assert_eq!(
+            bob_self.slot,
+            Some("6465766963652d310000000000000000000000000000000000000000deadbeef".to_string()),
+            "slot must survive self_update on Bob's side"
+        );
+
+        // Alice processes Bob's commit and verifies the slot is preserved in her view
+        alice_mdk
+            .process_message(&update.evolution_event)
+            .expect("Alice should process Bob's self-update");
+
+        let alice_leaves = alice_mdk.get_group_leaves(&group_id).unwrap();
+        let bob_from_alice = alice_leaves
+            .iter()
+            .find(|l| l.pubkey == bob_keys.public_key())
+            .expect("Alice should still see Bob");
+        assert_eq!(
+            bob_from_alice.slot,
+            Some("6465766963652d310000000000000000000000000000000000000000deadbeef".to_string()),
+            "slot must survive self_update on Alice's side too"
+        );
+    }
+
+    /// AC #3: two leaves under the same Nostr pubkey are distinguishable by
+    /// their `leaf_index` and their distinct slot identifiers. This is the
+    /// load-bearing scenario for multi-device clients.
+    #[test]
+    fn test_two_leaves_same_pubkey_distinct_slots() {
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+
+        let alice_mdk = create_test_mdk();
+        // Two distinct MDK instances for Bob — one per device. Each creates
+        // its own KP private state under its own storage; both KPs sign with
+        // the same Nostr key.
+        let bob_device_a_mdk = create_test_mdk();
+        let bob_device_b_mdk = create_test_mdk();
+
+        let admins = vec![alice_keys.public_key()];
+        let kp_a =
+            create_key_package_event_with_d_tag(&bob_device_a_mdk, &bob_keys, "6465766963652d610000000000000000000000000000000000000000deadbeef");
+        let kp_b =
+            create_key_package_event_with_d_tag(&bob_device_b_mdk, &bob_keys, "6465766963652d620000000000000000000000000000000000000000deadbeef");
+
+        let create_result = alice_mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![kp_a, kp_b],
+                create_nostr_group_config_data(admins),
+            )
+            .expect("Alice should create group with both Bob devices");
+        let group_id = create_result.group.mls_group_id.clone();
+        alice_mdk.merge_pending_commit(&group_id).unwrap();
+
+        // Each Bob device processes its own welcome (one rumor per KP).
+        assert_eq!(
+            create_result.welcome_rumors.len(),
+            2,
+            "expected one welcome rumor per added device"
+        );
+        let welcome_a = bob_device_a_mdk
+            .process_welcome(&EventId::all_zeros(), &create_result.welcome_rumors[0])
+            .or_else(|_| {
+                bob_device_a_mdk
+                    .process_welcome(&EventId::all_zeros(), &create_result.welcome_rumors[1])
+            })
+            .expect("device A should process one of the welcomes");
+        bob_device_a_mdk.accept_welcome(&welcome_a).unwrap();
+
+        let welcome_b = bob_device_b_mdk
+            .process_welcome(&EventId::all_zeros(), &create_result.welcome_rumors[0])
+            .or_else(|_| {
+                bob_device_b_mdk
+                    .process_welcome(&EventId::all_zeros(), &create_result.welcome_rumors[1])
+            })
+            .expect("device B should process one of the welcomes");
+        bob_device_b_mdk.accept_welcome(&welcome_b).unwrap();
+
+        let leaves = alice_mdk.get_group_leaves(&group_id).unwrap();
+        assert_eq!(leaves.len(), 3, "Alice + Bob[A] + Bob[B] = 3 leaves");
+
+        let bob_leaves: Vec<_> = leaves
+            .iter()
+            .filter(|l| l.pubkey == bob_keys.public_key())
+            .collect();
+        assert_eq!(bob_leaves.len(), 2, "Bob has two leaves");
+
+        let slots: BTreeSet<Option<String>> =
+            bob_leaves.iter().map(|l| l.slot.clone()).collect();
+        let expected: BTreeSet<Option<String>> = [
+            Some("6465766963652d610000000000000000000000000000000000000000deadbeef".to_string()),
+            Some("6465766963652d620000000000000000000000000000000000000000deadbeef".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(slots, expected, "slots must match the d_tags");
+
+        // Distinct leaf indices
+        assert_ne!(
+            bob_leaves[0].leaf_index, bob_leaves[1].leaf_index,
+            "two leaves of the same pubkey must have distinct indices"
+        );
+
+        // get_members deduplicates and returns a single Bob entry
+        let members = alice_mdk.get_members(&group_id).unwrap();
+        assert_eq!(members.len(), 2, "get_members deduplicates by pubkey");
+        assert!(members.contains(&bob_keys.public_key()));
+    }
+
+    /// AC #4: removing a single leaf by index removes ONLY that leaf, not
+    /// sibling leaves with the same pubkey. The user's other devices stay.
+    #[test]
+    fn test_remove_leaves_removes_only_target_device() {
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+
+        let alice_mdk = create_test_mdk();
+        let bob_device_a_mdk = create_test_mdk();
+        let bob_device_b_mdk = create_test_mdk();
+
+        let admins = vec![alice_keys.public_key()];
+        let kp_a =
+            create_key_package_event_with_d_tag(&bob_device_a_mdk, &bob_keys, "6465766963652d610000000000000000000000000000000000000000deadbeef");
+        let kp_b =
+            create_key_package_event_with_d_tag(&bob_device_b_mdk, &bob_keys, "6465766963652d620000000000000000000000000000000000000000deadbeef");
+
+        let create_result = alice_mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![kp_a, kp_b],
+                create_nostr_group_config_data(admins),
+            )
+            .unwrap();
+        let group_id = create_result.group.mls_group_id.clone();
+        alice_mdk.merge_pending_commit(&group_id).unwrap();
+
+        // Find Bob's device-b leaf index from Alice's view
+        let leaves_before = alice_mdk.get_group_leaves(&group_id).unwrap();
+        let device_b = leaves_before
+            .iter()
+            .find(|l| l.slot.as_deref() == Some("6465766963652d620000000000000000000000000000000000000000deadbeef"))
+            .expect("device-b leaf must be present");
+        let device_b_idx = device_b.leaf_index;
+
+        // Remove only device-b
+        alice_mdk
+            .remove_leaves(&group_id, &[device_b_idx])
+            .expect("Alice should remove Bob's device-b leaf");
+        alice_mdk.merge_pending_commit(&group_id).unwrap();
+
+        let leaves_after = alice_mdk.get_group_leaves(&group_id).unwrap();
+        assert_eq!(
+            leaves_after.len(),
+            2,
+            "after removing one of Bob's leaves we should have 2 leaves total"
+        );
+
+        // device-a survives
+        let surviving_bob_leaves: Vec<_> = leaves_after
+            .iter()
+            .filter(|l| l.pubkey == bob_keys.public_key())
+            .collect();
+        assert_eq!(surviving_bob_leaves.len(), 1);
+        assert_eq!(
+            surviving_bob_leaves[0].slot,
+            Some("6465766963652d610000000000000000000000000000000000000000deadbeef".to_string()),
+            "device-a should survive"
+        );
+
+        // get_members still contains Bob
+        let members = alice_mdk.get_members(&group_id).unwrap();
+        assert!(
+            members.contains(&bob_keys.public_key()),
+            "Bob should still be in members because device-a remains"
+        );
+    }
+
+    /// AC #5: `remove_leaves` rejects removing the caller's own leaf.
+    #[test]
+    fn test_remove_leaves_self_removal_rejected() {
+        let (alice_mdk, _bob_mdk, _alice_keys, _bob_keys, group_id) = setup_two_member_group();
+
+        let leaves = alice_mdk.get_group_leaves(&group_id).unwrap();
+        let own_idx = leaves
+            .iter()
+            .find(|l| l.is_own_leaf)
+            .expect("Alice has an own leaf")
+            .leaf_index;
+
+        let res = alice_mdk.remove_leaves(&group_id, &[own_idx]);
+        assert!(res.is_err(), "self-removal must be rejected");
+        let err = res.unwrap_err().to_string();
+        assert!(
+            err.contains("Cannot remove your own leaf"),
+            "error should mention own-leaf removal: got {}",
+            err
+        );
+
+        // No state change
+        let after = alice_mdk.get_group_leaves(&group_id).unwrap();
+        assert_eq!(after.len(), 2);
+    }
+
+    /// Defensive: empty `leaf_indices` is rejected.
+    #[test]
+    fn test_remove_leaves_empty_input_rejected() {
+        let (alice_mdk, _bob_mdk, _alice_keys, _bob_keys, group_id) = setup_two_member_group();
+
+        let res = alice_mdk.remove_leaves(&group_id, &[]);
+        assert!(res.is_err(), "empty input must be rejected");
+        let err = res.unwrap_err().to_string();
+        assert!(
+            err.contains("must not be empty"),
+            "error should mention empty input: got {}",
+            err
+        );
+    }
+
+    /// Defensive: an out-of-range or hole leaf index is rejected.
+    #[test]
+    fn test_remove_leaves_invalid_index_rejected() {
+        let (alice_mdk, _bob_mdk, _alice_keys, _bob_keys, group_id) = setup_two_member_group();
+
+        let res = alice_mdk.remove_leaves(&group_id, &[999]);
+        assert!(res.is_err());
+        let err = res.unwrap_err().to_string();
+        assert!(
+            err.contains("does not exist"),
+            "error should mention non-existent leaf: got {}",
+            err
+        );
+
+        // No state change
+        let after = alice_mdk.get_members(&group_id).unwrap();
+        assert_eq!(after.len(), 2);
+    }
+
+    /// AC #6: removing a leaf by index works correctly even after a prior
+    /// removal has created a hole. Mirror of `test_remove_members_with_tree_holes`
+    /// but exercising the new `remove_leaves` API.
+    #[test]
+    fn test_remove_leaves_with_tree_holes() {
         let alice_keys = Keys::generate();
         let bob_keys = Keys::generate();
         let charlie_keys = Keys::generate();
@@ -6881,34 +7499,163 @@ mod tests {
         let charlie_mdk = create_test_mdk();
         let dave_mdk = create_test_mdk();
 
+        let admins = vec![alice_keys.public_key()];
+        let bob_kp = create_key_package_event(&bob_mdk, &bob_keys);
+        let charlie_kp = create_key_package_event(&charlie_mdk, &charlie_keys);
+        let dave_kp = create_key_package_event(&dave_mdk, &dave_keys);
+
         let create_result = alice_mdk
             .create_group(
                 &alice_keys.public_key(),
-                vec![
-                    create_key_package_event(&bob_mdk, &bob_keys),
-                    create_key_package_event(&charlie_mdk, &charlie_keys),
-                    create_key_package_event(&dave_mdk, &dave_keys),
-                ],
-                create_nostr_group_config_data(vec![alice_keys.public_key()]),
+                vec![bob_kp, charlie_kp, dave_kp],
+                create_nostr_group_config_data(admins),
             )
-            .expect("Alice should create group");
-
+            .unwrap();
         let group_id = create_result.group.mls_group_id.clone();
-        alice_mdk
-            .merge_pending_commit(&group_id)
-            .expect("Alice should merge commit");
+        alice_mdk.merge_pending_commit(&group_id).unwrap();
+
+        // Step 1: remove Charlie via remove_members (creates a hole)
         alice_mdk
             .remove_members(&group_id, &[charlie_keys.public_key()])
-            .expect("Should remove Charlie");
-        alice_mdk
-            .merge_pending_commit(&group_id)
-            .expect("Should merge Charlie removal");
+            .unwrap();
+        alice_mdk.merge_pending_commit(&group_id).unwrap();
 
-        let leaf_map = alice_mdk.group_leaf_map(&group_id).unwrap();
-        assert_eq!(leaf_map.get(&0), Some(&alice_keys.public_key()));
-        assert_eq!(leaf_map.get(&1), Some(&bob_keys.public_key()));
-        assert_eq!(leaf_map.get(&3), Some(&dave_keys.public_key()));
-        assert!(!leaf_map.contains_key(&2));
+        // Step 2: locate Dave by pubkey via get_group_leaves and capture his
+        // post-hole leaf index — this is the load-bearing assertion for the
+        // tree-hole regression: enumerate-by-position would put Dave at 2,
+        // but his actual leaf index is 3.
+        let leaves_after_hole = alice_mdk.get_group_leaves(&group_id).unwrap();
+        let dave_leaf = leaves_after_hole
+            .iter()
+            .find(|l| l.pubkey == dave_keys.public_key())
+            .expect("Dave should still be present");
+        assert_eq!(
+            dave_leaf.leaf_index, 3,
+            "Dave's leaf index should remain at 3 even after Charlie's removal created a hole at 2"
+        );
+
+        // Step 3: remove Dave by leaf index via remove_leaves
+        alice_mdk
+            .remove_leaves(&group_id, &[dave_leaf.leaf_index])
+            .expect("Alice should remove Dave by leaf index");
+        alice_mdk.merge_pending_commit(&group_id).unwrap();
+
+        let final_members = alice_mdk.get_members(&group_id).unwrap();
+        assert_eq!(final_members.len(), 2);
+        assert!(final_members.contains(&alice_keys.public_key()));
+        assert!(final_members.contains(&bob_keys.public_key()));
+        assert!(!final_members.contains(&dave_keys.public_key()));
+    }
+
+    /// Admin semantics: removing one of an admin's two devices does NOT
+    /// demote the admin, because the admin still owns at least one leaf.
+    #[test]
+    fn test_remove_leaves_preserves_admin_when_other_device_remains() {
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+
+        let alice_mdk = create_test_mdk();
+        let bob_device_a_mdk = create_test_mdk();
+        let bob_device_b_mdk = create_test_mdk();
+
+        // Bob is also an admin
+        let admins = vec![alice_keys.public_key(), bob_keys.public_key()];
+
+        let kp_a =
+            create_key_package_event_with_d_tag(&bob_device_a_mdk, &bob_keys, "6465766963652d610000000000000000000000000000000000000000deadbeef");
+        let kp_b =
+            create_key_package_event_with_d_tag(&bob_device_b_mdk, &bob_keys, "6465766963652d620000000000000000000000000000000000000000deadbeef");
+
+        let create_result = alice_mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![kp_a, kp_b],
+                create_nostr_group_config_data(admins),
+            )
+            .unwrap();
+        let group_id = create_result.group.mls_group_id.clone();
+        alice_mdk.merge_pending_commit(&group_id).unwrap();
+
+        // Remove Bob's device-b
+        let leaves = alice_mdk.get_group_leaves(&group_id).unwrap();
+        let device_b_idx = leaves
+            .iter()
+            .find(|l| l.slot.as_deref() == Some("6465766963652d620000000000000000000000000000000000000000deadbeef"))
+            .unwrap()
+            .leaf_index;
+
+        alice_mdk
+            .remove_leaves(&group_id, &[device_b_idx])
+            .expect("removing one of two devices should succeed");
+        alice_mdk.merge_pending_commit(&group_id).unwrap();
+
+        // Bob must still be an admin because device-a survives
+        let mls_group = alice_mdk
+            .load_mls_group(&group_id)
+            .unwrap()
+            .expect("group should exist");
+        let group_data = NostrGroupDataExtension::from_group(&mls_group).unwrap();
+        assert!(
+            group_data.admins.contains(&bob_keys.public_key()),
+            "Bob should remain an admin because his other device still exists"
+        );
+        assert!(
+            group_data.admins.contains(&alice_keys.public_key()),
+            "Alice should still be an admin"
+        );
+    }
+
+    /// Admin semantics: removing the LAST leaf of an admin who has only one
+    /// device DOES strip them from the admin list. Mirrors `remove_members`
+    /// behaviour for the single-leaf-per-pubkey case.
+    #[test]
+    fn test_remove_leaves_demotes_admin_when_last_device_removed() {
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+
+        // Both are admins
+        let admins = vec![alice_keys.public_key(), bob_keys.public_key()];
+        let bob_kp = create_key_package_event(&bob_mdk, &bob_keys);
+
+        let create_result = alice_mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![bob_kp],
+                create_nostr_group_config_data(admins),
+            )
+            .unwrap();
+        let group_id = create_result.group.mls_group_id.clone();
+        alice_mdk.merge_pending_commit(&group_id).unwrap();
+
+        // Remove Bob's only leaf
+        let leaves = alice_mdk.get_group_leaves(&group_id).unwrap();
+        let bob_idx = leaves
+            .iter()
+            .find(|l| l.pubkey == bob_keys.public_key())
+            .unwrap()
+            .leaf_index;
+
+        alice_mdk
+            .remove_leaves(&group_id, &[bob_idx])
+            .expect("removing Bob's only leaf should succeed");
+        alice_mdk.merge_pending_commit(&group_id).unwrap();
+
+        let mls_group = alice_mdk
+            .load_mls_group(&group_id)
+            .unwrap()
+            .expect("group should exist");
+        let group_data = NostrGroupDataExtension::from_group(&mls_group).unwrap();
+        assert!(
+            !group_data.admins.contains(&bob_keys.public_key()),
+            "Bob should be stripped from admins because his only leaf was removed"
+        );
+        assert!(
+            group_data.admins.contains(&alice_keys.public_key()),
+            "Alice must still be an admin"
+        );
     }
 
     // ============================================================================

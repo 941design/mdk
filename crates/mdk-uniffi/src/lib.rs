@@ -924,6 +924,36 @@ impl Mdk {
         update_group_result_to_uniffi(result)
     }
 
+    /// Returns one [`GroupLeafInfo`] per occupied leaf in the ratchet tree.
+    ///
+    /// Unlike `get_members`, which deduplicates by Nostr public key, this
+    /// preserves one entry per leaf — including multiple leaves owned by the
+    /// same Nostr pubkey (one device per leaf). Each entry includes the slot
+    /// identifier embedded by `create_key_package_for_event_with_options`
+    /// when the leaf was produced through the addressable-key-package flow.
+    ///
+    /// Callers can use the returned `leaf_index` together with `remove_leaves`
+    /// to remove a single device without affecting the user's other leaves.
+    pub fn get_group_leaves(
+        &self,
+        mls_group_id: String,
+    ) -> Result<Vec<GroupLeafInfo>, MdkUniffiError> {
+        let group_id = parse_group_id(&mls_group_id)?;
+        Ok(self
+            .lock()?
+            .get_group_leaves(&group_id)?
+            .into_iter()
+            .map(|l| GroupLeafInfo {
+                leaf_index: l.leaf_index,
+                pubkey: l.pubkey.to_hex(),
+                encryption_key: l.encryption_key,
+                signature_key: l.signature_key,
+                slot: l.slot,
+                is_own_leaf: l.is_own_leaf,
+            })
+            .collect())
+    }
+
     /// Get messages for a group with optional pagination
     ///
     /// # Arguments
@@ -1198,6 +1228,50 @@ impl Mdk {
         let mdk = self.lock()?;
         let result = mdk.remove_members(&group_id, &pubkeys)?;
         update_group_result_to_uniffi(result)
+    }
+
+    /// Remove specific leaves from a group by their leaf index.
+    ///
+    /// Leaf-precision counterpart to `remove_members`: when a single Nostr
+    /// pubkey owns multiple leaves (one per device), `remove_members` removes
+    /// every leaf bound to that pubkey, while this method removes only the
+    /// leaves whose indices appear in `leaf_indices`. An admin keeps their
+    /// admin status as long as at least one of their leaves survives.
+    pub fn remove_leaves(
+        &self,
+        mls_group_id: String,
+        leaf_indices: Vec<u32>,
+    ) -> Result<UpdateGroupResult, MdkUniffiError> {
+        let group_id = parse_group_id(&mls_group_id)?;
+
+        let mdk = self.lock()?;
+        let result = mdk.remove_leaves(&group_id, &leaf_indices)?;
+
+        let evolution_event_json = serde_json::to_string(&result.evolution_event).map_err(|e| {
+            MdkUniffiError::InvalidInput(format!("Failed to serialize evolution event: {e}"))
+        })?;
+
+        let welcome_rumors_json: Option<Vec<String>> = result
+            .welcome_rumors
+            .map(|rumors| {
+                rumors
+                    .iter()
+                    .map(|rumor| {
+                        serde_json::to_string(rumor).map_err(|e| {
+                            MdkUniffiError::InvalidInput(format!(
+                                "Failed to serialize welcome rumor: {e}"
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?;
+
+        Ok(UpdateGroupResult {
+            evolution_event_json,
+            welcome_rumors_json,
+            mls_group_id: hex::encode(result.mls_group_id.as_slice()),
+        })
     }
 
     /// Merge pending commit for a group
@@ -1668,6 +1742,32 @@ pub struct UpdateGroupResult {
     pub welcome_rumors_json: Option<Vec<String>>,
     /// Hex-encoded MLS group ID
     pub mls_group_id: String,
+}
+
+/// Public information about a single leaf in an MLS group, including the
+/// per-device "slot" identifier (the `d` tag value passed to
+/// `create_key_package_for_event_with_options`) when one is present.
+///
+/// Use this to enumerate every leaf — including multiple leaves that share
+/// the same Nostr public key (e.g. one device per leaf). Each leaf has a
+/// distinct `leaf_index` even when their `pubkey` collides.
+#[derive(uniffi::Record)]
+pub struct GroupLeafInfo {
+    /// Stable leaf index in the ratchet tree (may have holes after removals).
+    pub leaf_index: u32,
+    /// Hex-encoded Nostr public key parsed from the leaf's BasicCredential.
+    pub pubkey: String,
+    /// Hex-encoded HPKE encryption key.
+    pub encryption_key: String,
+    /// Hex-encoded MLS signature key.
+    pub signature_key: String,
+    /// Slot identifier embedded in the leaf node's `application_id` extension
+    /// when the leaf was produced via `create_key_package_for_event_with_options`
+    /// with an explicit `d_tag`. `None` when the leaf has no `application_id`
+    /// extension or when the bytes are not valid UTF-8.
+    pub slot: Option<String>,
+    /// `true` if this leaf belongs to the local MDK instance.
+    pub is_own_leaf: bool,
 }
 
 /// Configuration for updating group data with optional fields

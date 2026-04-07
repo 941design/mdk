@@ -186,6 +186,42 @@ where
         .expect("Failed to sign legacy key package event")
 }
 
+/// Creates a key package event using `create_key_package_for_event_with_options`
+/// with an explicit `d_tag` slot identifier.
+///
+/// Use this helper in tests that exercise multi-device scenarios where the
+/// same Nostr pubkey publishes more than one KeyPackage and each leaf needs
+/// a stable application-defined slot.
+pub fn create_key_package_event_with_d_tag<Storage>(
+    mdk: &MDK<Storage>,
+    member_keys: &Keys,
+    d_tag: &str,
+) -> Event
+where
+    Storage: MdkStorageProvider,
+{
+    let relays = vec![RelayUrl::parse("wss://test.relay").unwrap()];
+    let crate::key_packages::KeyPackageEventData {
+        content: key_package_hex,
+        tags_30443: tags,
+        ..
+    } = mdk
+        .create_key_package_for_event_with_options(
+            &member_keys.public_key(),
+            relays,
+            crate::key_packages::KeyPackageOptions {
+                existing_d_tag: Some(d_tag.to_string()),
+                ..Default::default()
+            },
+        )
+        .expect("Failed to create key package with d_tag");
+
+    EventBuilder::new(MLS_KEY_PACKAGE_KIND, key_package_hex)
+        .tags(tags)
+        .sign_with_keys(member_keys)
+        .expect("Failed to sign event")
+}
+
 /// Creates standard test group configuration data
 ///
 /// Returns a NostrGroupConfigData with random test values for creating test groups.
