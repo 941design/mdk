@@ -532,12 +532,19 @@ where
 
     /// Selects the best KeyPackage event from a set of candidates.
     ///
+    /// Each candidate is run through the full [`Self::parse_key_package`] pipeline before being
+    /// considered, so a returned event is guaranteed to satisfy the same invariants MDK enforces
+    /// at consume time: required tags present and well-formed, encoding tag present, TLS-decode
+    /// and signature validation succeed, the credential identity binds to the event signer, and
+    /// the `i` tag matches the computed `KeyPackageRef`. Anything that would later be rejected
+    /// by [`Self::parse_key_package`] is silently dropped from the candidate pool here so callers
+    /// never receive an event MDK itself would refuse.
+    ///
     /// Selection criteria (in order):
-    /// 1. Reject events that are not kind 30443 or legacy kind 443
-    /// 2. Reject events that fail KeyPackage decoding
-    /// 3. Prefer non-last_resort over last_resort candidates
-    /// 4. Among equal-priority candidates, prefer the newest `created_at`
-    /// 5. Tie-break by lexicographically smallest event id
+    /// 1. Reject events that fail [`Self::parse_key_package`]
+    /// 2. Prefer non-last_resort over last_resort candidates
+    /// 3. Among equal-priority candidates, prefer the newest `created_at`
+    /// 4. Tie-break by lexicographically smallest event id
     ///
     /// # Arguments
     ///
@@ -555,16 +562,11 @@ where
         let mut valid: Vec<ValidCandidate> = Vec::new();
 
         for event in candidates {
-            if event.kind != MLS_KEY_PACKAGE_KIND && event.kind != MLS_KEY_PACKAGE_KIND_LEGACY {
-                continue;
-            }
-
-            let encoding = match ContentEncoding::from_tags(event.tags.iter()) {
-                Some(e) => e,
-                None => continue,
-            };
-
-            let kp = match self.parse_serialized_key_package(&event.content, encoding) {
+            // Run the full validation pipeline (kind, d-tag, required tags, encoding,
+            // TLS-decode, identity binding, i-tag/content consistency). Skip silently
+            // on any failure so the candidate pool only contains events MDK would
+            // accept on a subsequent parse_key_package call.
+            let kp = match self.parse_key_package(event) {
                 Ok(kp) => kp,
                 Err(_) => continue,
             };
@@ -1055,8 +1057,12 @@ fn get_d_tag_value(event: &Event) -> Option<&str> {
 ///
 /// # Errors
 ///
-/// Returns an error if any event is not a key package event (kind 443 or 30443),
-/// or if the events slice is empty.
+/// Returns an error if:
+/// * the events slice is empty, or
+/// * any event is not a key package event (kind 443 or 30443), or
+/// * any kind:30443 event is missing a usable `d` tag (a deletion event with only an `e`
+///   reference is not sufficient to remove the addressable slot from relays, so we refuse
+///   rather than emit a half-formed deletion that silently leaves the slot live).
 pub fn create_delete_key_package_tags(events: &[Event]) -> Result<Vec<Tag>, Error> {
     use crate::constant::{MLS_KEY_PACKAGE_KIND, MLS_KEY_PACKAGE_KIND_LEGACY};
 
@@ -1080,17 +1086,23 @@ pub fn create_delete_key_package_tags(events: &[Event]) -> Result<Vec<Tag>, Erro
         observed_kinds.insert(event.kind);
         tags.push(Tag::event(event.id));
 
-        // For addressable kind:30443 events, include an `a` tag with the
-        // coordinate so relays can match by (kind, pubkey, d) tuple.
+        // For addressable kind:30443 events, the `a` tag is mandatory: relays match
+        // addressable replacements by (kind, pubkey, d) tuple, so a deletion that
+        // omits the `a` tag would only remove the bare event id and leave the
+        // addressable slot live. Refuse to construct a half-formed deletion.
         if event.kind == MLS_KEY_PACKAGE_KIND {
-            if let Some(d_value) = get_d_tag_value(event) {
-                let coordinate = Coordinate {
-                    kind: MLS_KEY_PACKAGE_KIND,
-                    public_key: event.pubkey,
-                    identifier: d_value.to_string(),
-                };
-                tags.push(Tag::coordinate(coordinate, None));
-            }
+            let d_value = get_d_tag_value(event).ok_or_else(|| {
+                Error::KeyPackage(format!(
+                    "kind:30443 event {} is missing or has empty d tag; cannot construct addressable deletion coordinate",
+                    event.id
+                ))
+            })?;
+            let coordinate = Coordinate {
+                kind: MLS_KEY_PACKAGE_KIND,
+                public_key: event.pubkey,
+                identifier: d_value.to_string(),
+            };
+            tags.push(Tag::coordinate(coordinate, None));
         }
     }
 
@@ -3904,6 +3916,82 @@ mod tests {
         ));
     }
 
+    /// Regression test for the deletion-helper gap surfaced in code review:
+    /// previously, a kind:30443 event with a missing/empty `d` tag silently produced a
+    /// deletion request containing only the `e` reference. Relays match addressable
+    /// replacements by `(kind, pubkey, d)` tuple, so an `e`-only deletion does not
+    /// invalidate the addressable slot — the helper "succeeded" but the slot stayed
+    /// live. The helper now refuses such input rather than emitting a half-formed
+    /// deletion the caller cannot tell is incomplete.
+    #[test]
+    fn test_create_delete_tags_kind_30443_missing_d_tag_fails() {
+        let mdk = create_test_mdk();
+        let keys = Keys::generate();
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
+
+        let KeyPackageEventData {
+            content,
+            tags_30443: mut tags,
+            ..
+        } = mdk
+            .create_key_package_for_event(&keys.public_key(), relays)
+            .unwrap();
+
+        // Strip the `d` tag (always position 0 by construction) before signing, so we
+        // end up with a syntactically signed kind:30443 event that lacks the addressable
+        // identifier. parse_key_package would reject this on its own; the helper used
+        // to silently emit an `e`-only deletion. With the fix it must error.
+        tags.remove(0);
+
+        let event = EventBuilder::new(MLS_KEY_PACKAGE_KIND, content)
+            .tags(tags)
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let result = super::create_delete_key_package_tags(&[event]);
+        assert!(
+            result.is_err(),
+            "kind:30443 event missing a d tag must not produce a deletion request"
+        );
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            msg.contains("d tag"),
+            "error should mention the missing d tag, got: {}",
+            msg
+        );
+    }
+
+    /// Empty d tag is the same hazard as a missing d tag (the addressable coordinate is
+    /// unconstructible either way). Make sure the helper refuses both shapes.
+    #[test]
+    fn test_create_delete_tags_kind_30443_empty_d_tag_fails() {
+        let mdk = create_test_mdk();
+        let keys = Keys::generate();
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
+
+        let KeyPackageEventData {
+            content,
+            tags_30443: mut tags,
+            ..
+        } = mdk
+            .create_key_package_for_event(&keys.public_key(), relays)
+            .unwrap();
+
+        // Replace the d tag with an empty value rather than removing it.
+        tags[0] = Tag::identifier("");
+
+        let event = EventBuilder::new(MLS_KEY_PACKAGE_KIND, content)
+            .tags(tags)
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let result = super::create_delete_key_package_tags(&[event]);
+        assert!(
+            result.is_err(),
+            "kind:30443 event with an empty d tag must not produce a deletion request"
+        );
+    }
+
     // ======================================================================
     // select_best_key_package tests
     // ======================================================================
@@ -3948,6 +4036,42 @@ mod tests {
             .unwrap();
 
         assert!(mdk.select_best_key_package(&[event]).is_none());
+    }
+
+    /// Regression test for the security gap surfaced in code review:
+    /// `select_best_key_package` previously skipped the credential-identity-vs-event-signer
+    /// binding check that `parse_key_package` enforces. A forged event whose credential
+    /// identity claimed a victim's pubkey but was signed by an attacker would have ranked
+    /// alongside genuine candidates and could be returned as "best", letting a caller act
+    /// on an event MDK itself would later reject. With ranking now routed through
+    /// `parse_key_package`, the forgery is dropped from the candidate pool entirely.
+    #[test]
+    fn test_select_best_key_package_rejects_identity_mismatch() {
+        let mdk = create_test_mdk();
+        let victim_keys = Keys::generate();
+        let attacker_keys = Keys::generate();
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
+
+        // Build a key package whose credential identity claims the victim's pubkey...
+        let KeyPackageEventData {
+            content,
+            tags_30443: tags,
+            ..
+        } = mdk
+            .create_key_package_for_event(&victim_keys.public_key(), relays)
+            .unwrap();
+
+        // ...but sign the event with the attacker's keys. parse_key_package rejects this
+        // with KeyPackageIdentityMismatch; select_best_key_package must therefore drop it.
+        let forged = EventBuilder::new(MLS_KEY_PACKAGE_KIND, content)
+            .tags(tags)
+            .sign_with_keys(&attacker_keys)
+            .unwrap();
+
+        assert!(
+            mdk.select_best_key_package(&[forged]).is_none(),
+            "forged event with mismatched credential identity must not be selectable"
+        );
     }
 
     // ======================================================================
