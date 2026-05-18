@@ -484,15 +484,7 @@ where
                 }
                 Some(tag) => {
                     let d_value = tag.as_slice().get(1).map(|s| s.as_str()).unwrap_or("");
-                    if d_value.is_empty() {
-                        return Err(Error::KeyPackage(
-                            "d tag value must not be empty".to_string(),
-                        ));
-                    }
-                    // d tag can be any non-empty string. Per MIP-00, randomly generated
-                    // d tags are 64-character hex strings, but callers may supply
-                    // arbitrary slot identifiers (e.g., "device-1") for multi-device
-                    // scenarios. Accept any non-empty value.
+                    validate_d_tag_value(d_value, "d tag")?;
                 }
             }
         }
@@ -3627,50 +3619,6 @@ mod tests {
         assert!(
             matches!(result, Err(Error::KeyPackage(_))),
             "Should reject kind:30443 event with empty d tag value, got: {:?}",
-            result
-        );
-    }
-
-    /// Regression: parse_key_package accepts kind:30443 events with arbitrary non-empty `d` tag
-    /// values, including non-hex strings. Per MIP-00, randomly generated d tags are 64-char hex,
-    /// but callers may supply arbitrary slot identifiers (e.g., "device-1") for multi-device use.
-    #[test]
-    fn test_parse_key_package_accepts_kind_30443_arbitrary_d_tag() {
-        let mdk = create_test_mdk();
-        let keys = nostr::Keys::generate();
-        let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
-
-        let KeyPackageEventData {
-            content: key_package_str,
-            tags_30443: tags,
-            hash_ref: _hash_ref,
-            d_tag: _d_value,
-            ..
-        } = mdk
-            .create_key_package_for_event(&keys.public_key(), relays)
-            .expect("Failed to create key package");
-
-        // Replace the `d` tag with a short human-readable slot identifier
-        let tags_with_short_d: Vec<Tag> = tags
-            .into_iter()
-            .map(|t| {
-                if t.kind() == TagKind::d() {
-                    Tag::identifier("device-1")
-                } else {
-                    t
-                }
-            })
-            .collect();
-
-        let event = EventBuilder::new(MLS_KEY_PACKAGE_KIND, key_package_str)
-            .tags(tags_with_short_d)
-            .sign_with_keys(&keys)
-            .unwrap();
-
-        let result = mdk.parse_key_package(&event);
-        assert!(
-            result.is_ok(),
-            "Should accept kind:30443 event with arbitrary non-empty d tag value, got: {:?}",
             result
         );
     }
